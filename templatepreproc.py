@@ -7,6 +7,12 @@
 from docx import Document
 import re, os, sys
 import logging
+
+from docx.shared import Pt, RGBColor
+from collections import Counter, defaultdict
+import unicodedata
+import string
+
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("TemplPrep")
 logger.setLevel(logging.WARNING)
@@ -111,7 +117,122 @@ def preprocess_field_codes(docu: Document):
                 i = i + 1       # take the next run
 
 
-def do_checks_and_fixes(input_filename, input_dir):
+def create_fieldcode_docx(fieldcodes, contexts):
+    """
+    Create a docx file with a table based on the provided list of strings (fieldcodes).
+
+    Args:
+        fieldcodes (list): List of strings to include in the table.
+        contexts (dict): Dictionary mapping fieldcodes to lists of context strings.
+
+    Returns:
+        Document object: The created docx.Document object.
+    """
+    def normalize_key(key):
+        """Normalize a key by removing diacritics and replacing invalid characters."""
+        normalized = unicodedata.normalize('NFKD', key).encode('ascii', 'ignore').decode('utf-8')
+        normalized = ''.join(ch if ch in string.ascii_letters + string.digits + "_" else "_" for ch in normalized)
+        return normalized
+
+    def make_unique_key(base_key, used_keys):
+        """Make a key unique by appending a number if necessary."""
+        if base_key not in used_keys:
+            return base_key
+        counter = 1
+        new_key = f"{base_key}_{counter}"
+        while new_key in used_keys:
+            counter += 1
+            new_key = f"{base_key}_{counter}"
+        return new_key
+
+    # Initialize the document
+    doc = Document()
+    table = doc.add_table(rows=1, cols=5)
+    table.style = 'Table Grid'
+
+    # Create header row
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Serial"
+    header_cells[1].text = "Key"
+    header_cells[2].text = "Description"
+    header_cells[3].text = "DocDisplay"
+    header_cells[4].text = "UsedIn"
+
+    used_keys = set()
+    serial_counter = 1
+
+    for fieldcode in fieldcodes:
+        # Check if the fieldcode is a valid Python identifier
+
+        if fieldcode.isidentifier() and all(ch in string.ascii_letters + string.digits + "_" for ch in fieldcode):
+            key = fieldcode
+            # print(f"valid identifyer {fieldcode}")
+        else:
+            normalized_key = normalize_key(fieldcode)
+            key = make_unique_key(normalized_key, used_keys)
+
+        # Track key usage
+        used_keys.add(key)
+
+        # Add a new row
+        row_cells = table.add_row().cells
+        row_cells[0].text = str(serial_counter)
+        row_cells[2].text = ""  # Description column is empty
+        row_cells[3].text = fieldcode
+        if len(contexts[fieldcode]) == 1:
+            row_cells[4].text = contexts[fieldcode][0]
+        else:       # Add all contexts to the "UsedIn" column
+            for ctx in contexts[fieldcode]:
+                run = row_cells[4].paragraphs[0].add_run()
+                run.text = ctx
+                run_sep = row_cells[4].paragraphs[0].add_run()
+                run_sep.text = ";  "
+                run.font.color.rgb = RGBColor(255, 0, 0)  # Set the font color to red
+                #  run.font.color.rgb = RGBColor(0, 0, 0)  # Set the font color to red
+
+        # Format the key cell if it was normalized
+        if key != fieldcode:
+            run = row_cells[1].paragraphs[0].add_run()
+            run.text = key
+            run.font.color.rgb = RGBColor(255, 0, 0)  # Set the font color to red
+            run.bold = True
+        else:
+            row_cells[1].paragraphs[0].add_run(key)
+
+        serial_counter += 1
+
+    return doc if serial_counter > 1 else None
+
+def extract_fieldcodes_and_contexts(doc):
+    """
+    Extract unique field codes and their contexts from a Word document.
+
+    Args:
+        doc (Document): A docx.Document object to extract field codes from.
+
+    Returns:
+        list: A list of unique field codes.
+        dict: A dictionary mapping each field code to a list of its contexts.
+    """
+    fieldcodes = []
+    contexts = defaultdict(list)
+    text = "".join([p.text for p in doc.paragraphs])
+
+    for match in re.finditer(r"<<([^<>]+)>>", text):
+        fieldcode = match.group(1)
+        start, end = match.start(), match.end()
+        context = text[max(0, start - 15):min(len(text), end + 15)]
+
+        if fieldcode not in fieldcodes:
+            fieldcodes.append(fieldcode)
+        contexts[fieldcode].append(context)
+
+    return fieldcodes, contexts
+
+
+
+
+def do_checks_and_fixes(input_filename, input_dir, extract_fieldcodes = False):
 
     
     # Create the PreProc subdirectory path
@@ -177,53 +298,86 @@ def do_checks_and_fixes(input_filename, input_dir):
                 lastchar_in_prev = run.text[-1]     # Preserve last char of this run if this is not an empty run. Used to test opening marks separated into two runs and closing marks separated into two runs accidentally 
 
     #print(checks)
-    print("  Test " + ("FAILED. Field code marks and their formatting should be checked." if any(checks) else "PASSED") +  f"  Saved {doc_output_fullpath}.")
+    if not any(checks):
+        print("  Test PASSED." +  f"  Saved {doc_output_fullpath}.")
+
+        if extract_fieldcodes:
+            fieldcode_filename = f"{base_name}_flds{ext}"
+            doc_fields_output_fullpath = os.path.join(preproc_dir, fieldcode_filename)
+
+            fieldcodes, contexts = extract_fieldcodes_and_contexts(docuT)
+            doc_fld = create_fieldcode_docx(fieldcodes, contexts)
+            if doc_fld:
+                doc_fld.core_properties.category = "Field codes from template for AI chatbot Lisa"
+                doc_fld.save(doc_fields_output_fullpath)
+                print(f"  Saved field list in {doc_fields_output_fullpath}.")
+
+    else:
+        print("  Test FAILED. Field code marks and their formatting should be checked." +  f"  Saved {doc_output_fullpath}.")
 
     return checks
 
-# Ensure a command-line argument is provided
-if len(sys.argv) < 2:
-    print("Usage: python templatepreproc.py <path> where <path> points to either a single template or a directory with templates.")
-    print("Templates are docx files with field codes between << and >>")
-    sys.exit(1)
 
-# Get the directory path from the command-line argument
-input_path = sys.argv[1]
+def main():
 
-input_abspath = os.path.abspath(input_path)
+    def printusage():
+        print("Usage: python templatepreproc.py [-f] <path>")
+        print("       <path> points to either a single template or a directory with templates.")
+        print("       -f: save the list of field codes found in the template. Output: [base_name]_flds.docx")
+        print("Templates are docx files with field codes between << and >>")
+        print("Output is saved in the PreProc subdirectory. If file exists it is overwritten.")
+        sys.exit(1)
 
-# Check if the provided path is a valid directory
-if os.path.isdir(input_path):
-    print(f"Processing all .docx files in directory '{input_path}'.")
+    # Ensure a command-line argument is provided
+    if len(sys.argv) < 2:
+        printusage()
 
-    #   Iterate over all .docx files in the given directory and call a function for each.
-    for file_name in os.listdir(input_abspath):
-        if file_name.endswith(".docx"):
-            print()
-            print(f"########  Processing .docx file '{file_name}':")            
-            logger.info("Processing template '%s' ",  file_name )
+    # Get the directory path from the command-line argument
 
-            errors = do_checks_and_fixes(file_name, input_abspath) # input_fullpath = os.path.join(input_abspath, file_name))
-            if any(errors):
-                print("This is a list of errors in the input template with a short context to help locate issues:")
-                print([item for item in errors if item])        # print only if error is not False
-            print()
+    extract_fieldcodes = (sys.argv[1] == "-f")
 
-    print(f"Completed all docx documents in {input_abspath}.")
+    if len(sys.argv) < 3 and extract_fieldcodes:
+        printusage()
 
-elif os.path.exists(input_path) and input_path.endswith(".docx"):
-    print()
-    print(f"#########  Processing .docx file '{input_path}':")
-    logger.info("Processing template '%s' ",  input_abspath )
+    input_path = sys.argv[2] if extract_fieldcodes else sys.argv[1]
 
-    errors = do_checks_and_fixes( os.path.basename(input_abspath), os.path.dirname(input_abspath) )
-    if any(errors):
-        print("This is a list of errors in the input template with a short context to help locate issues:")
-        print([item for item in errors if item])        # print only if the check item is not False
-    else: 
-        print(f"Completed template {input}")
+    input_abspath = os.path.abspath(input_path)
+
+    # Check if the provided path is a valid directory
+    if os.path.isdir(input_path):
+        print(f"Processing all .docx files in directory '{input_path}'.")
+
+        #   Iterate over all .docx files in the given directory and call a function for each.
+        for file_name in os.listdir(input_abspath):
+            if file_name.endswith(".docx"):
+                print()
+                print(f"########  Processing .docx file '{file_name}':")            
+                logger.info("Processing template '%s' ",  file_name )
+
+                errors = do_checks_and_fixes(file_name, input_abspath, extract_fieldcodes) # input_fullpath = os.path.join(input_abspath, file_name))
+                if any(errors):
+                    print("This is a list of errors in the input template with a short context to help locate issues:")
+                    print([item for item in errors if item])        # print only if error is not False
+                print()
+
+        print(f"Completed all docx documents in {input_abspath}.")
+
+    elif os.path.exists(input_path) and input_path.endswith(".docx"):
+        print()
+        print(f"#########  Processing .docx file '{input_path}':")
+        logger.info("Processing template '%s' ",  input_abspath )
+
+        errors = do_checks_and_fixes( os.path.basename(input_abspath), os.path.dirname(input_abspath), extract_fieldcodes )
+        if any(errors):
+            print("This is a list of errors in the input template with a short context to help locate issues:")
+            print([item for item in errors if item])        # print only if the check item is not False
+        else: 
+            print(f"Completed template {input_path}")
 
 
-else:
-    print("Error: path is not a directory or a docx file.")
-    sys.exit(1)
+    else:
+        print("Error: path is not a directory or a docx file.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
